@@ -1,37 +1,40 @@
 """
-Módulo principal de transcrição usando OpenAI Whisper.
+Módulo de transcrição aprimorado com melhor qualidade e robustez.
 """
 import json
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Union, Tuple
 import warnings
+import hashlib
 
 import whisper
 import torch
 import numpy as np
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
+from rich.panel import Panel
+from rich.table import Table
 
 from .config import (
     WHISPER_CONFIG, 
     TRANSCRIPT_DIR, 
     get_model_info,
-    OUTPUT_CONFIG
+    OUTPUT_CONFIG,
+    TEMP_DIR
 )
+from .audio_processor import AudioProcessor
 
-# Suprimir avisos do Whisper
 warnings.filterwarnings("ignore", category=UserWarning)
-
 console = Console()
 
 
 class WhisperTranscriber:
-    """Classe principal para transcrição de áudio usando Whisper."""
+    """Transcritor aprimorado com melhor qualidade e features avançadas."""
     
     def __init__(self, model_size: Optional[str] = None, device: Optional[str] = None):
         """
-        Inicializa o transcritor.
+        Inicializa o transcritor aprimorado.
         
         Args:
             model_size: Tamanho do modelo (tiny, base, small, medium, large)
@@ -40,6 +43,7 @@ class WhisperTranscriber:
         self.model_size = model_size or WHISPER_CONFIG["model_size"]
         self.device = device or WHISPER_CONFIG["device"]
         self.model = None
+        self.audio_processor = AudioProcessor()
         self._load_model()
         
     def _load_model(self):
@@ -61,7 +65,7 @@ class WhisperTranscriber:
             self.model = whisper.load_model(
                 self.model_size, 
                 device=self.device,
-                download_root=None  # Usa o diretório padrão ~/.cache/whisper
+                download_root=None
             )
             
             elapsed = time.time() - start_time
@@ -69,28 +73,35 @@ class WhisperTranscriber:
             
         console.print(f"✅ Modelo carregado em {elapsed:.1f}s no dispositivo: [bold green]{self.device}[/bold green]\n")
     
-    def transcribe(
+    def transcribe_enhanced(
         self, 
         audio_path: Union[str, Path],
         language: Optional[str] = None,
         task: str = "transcribe",
         initial_prompt: Optional[str] = None,
-        temperature: float = 0.0,
+        temperature: Union[float, List[float]] = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0],
+        compression_ratio_threshold: float = 2.4,
+        logprob_threshold: float = -1.0,
+        no_speech_threshold: float = 0.6,
+        condition_on_previous_text: bool = True,
         **kwargs
     ) -> Dict:
         """
-        Transcreve um arquivo de áudio.
+        Transcrição aprimorada com melhor qualidade e robustez.
         
         Args:
-            audio_path: Caminho para o arquivo de áudio
-            language: Idioma do áudio (None para detecção automática)
+            audio_path: Caminho do arquivo de áudio
+            language: Idioma (None para detecção automática)
             task: 'transcribe' ou 'translate'
-            initial_prompt: Prompt inicial para guiar o modelo
-            temperature: Temperatura para geração (0 = determinístico)
-            **kwargs: Argumentos adicionais para whisper.transcribe
+            initial_prompt: Prompt para guiar o modelo
+            temperature: Temperatura(s) para fallback em caso de falha
+            compression_ratio_threshold: Threshold para detectar repetições
+            logprob_threshold: Threshold para detectar baixa confiança
+            no_speech_threshold: Threshold para detectar silêncio
+            condition_on_previous_text: Usar contexto anterior
             
         Returns:
-            Dict com transcrição e metadados
+            Dict com transcrição completa e metadados
         """
         audio_path = Path(audio_path)
         if not audio_path.exists():
@@ -98,23 +109,95 @@ class WhisperTranscriber:
         
         console.print(f"🎵 Processando: [bold]{audio_path.name}[/bold]")
         
-        # Configurar parâmetros
+        # Pré-processar áudio se necessário
+        processed_path = self._preprocess_audio(audio_path)
+        
+        # Detectar idioma se não especificado
+        if not language:
+            language = self.detect_language(processed_path)
+        
+        # Configurar parâmetros otimizados
         params = {
-            "language": language or WHISPER_CONFIG["language"],
+            "language": language,
             "task": task,
             "fp16": WHISPER_CONFIG["fp16"] and self.device == "cuda",
-            "verbose": WHISPER_CONFIG["verbose"],
+            "verbose": False,  # Desabilitar verbose padrão
             "temperature": temperature,
-            "word_timestamps": OUTPUT_CONFIG["include_timestamps"],
+            "compression_ratio_threshold": compression_ratio_threshold,
+            "logprob_threshold": logprob_threshold,
+            "no_speech_threshold": no_speech_threshold,
+            "condition_on_previous_text": condition_on_previous_text,
+            "word_timestamps": True,  # Sempre usar para melhor precisão
+            "initial_prompt": initial_prompt or self._get_language_prompt(language),
+            "beam_size": 5,  # Melhor qualidade
+            "best_of": 5,   # Múltiplas tentativas
+            "patience": 1.0,
         }
         
-        if initial_prompt:
-            params["initial_prompt"] = initial_prompt
-        
-        # Atualizar com kwargs adicionais
+        # Atualizar com kwargs
         params.update(kwargs)
         
-        # Transcrever com progress bar
+        # Transcrever com estratégia de chunks para arquivos longos
+        audio_info = self.audio_processor.get_audio_info(processed_path)
+        duration = audio_info.get("duration", 0)
+        
+        if duration > 300:  # Se maior que 5 minutos, usar chunks
+            console.print(f"📊 Áudio longo detectado ({duration:.1f}s), usando processamento em chunks...")
+            result = self._transcribe_long_audio(processed_path, params)
+        else:
+            result = self._transcribe_single(processed_path, params)
+        
+        # Pós-processar resultado
+        result = self._postprocess_transcription(result)
+        
+        # Limpar arquivo temporário se criado
+        if processed_path != audio_path and processed_path.exists():
+            processed_path.unlink()
+        
+        return result
+    
+    def _preprocess_audio(self, audio_path: Path) -> Path:
+        """
+        Pré-processa o áudio para melhor qualidade de transcrição.
+        
+        Args:
+            audio_path: Caminho do áudio original
+            
+        Returns:
+            Path do áudio processado
+        """
+        # Verificar se precisa normalização
+        audio_info = self.audio_processor.get_audio_info(audio_path)
+        
+        # Se já está no formato ideal, retornar
+        if (audio_info.get("sample_rate") == 16000 and 
+            audio_info.get("channels") == 1 and
+            audio_path.suffix.lower() == '.wav'):
+            return audio_path
+        
+        console.print("🔧 Otimizando áudio para transcrição...")
+        
+        # Converter e normalizar
+        processed_path = self.audio_processor.convert_to_wav(audio_path)
+        normalized_path = self.audio_processor.normalize_audio(processed_path)
+        
+        # Remover arquivo intermediário
+        if processed_path != audio_path and processed_path.exists():
+            processed_path.unlink()
+        
+        return normalized_path
+    
+    def _transcribe_single(self, audio_path: Path, params: Dict) -> Dict:
+        """
+        Transcreve um único arquivo de áudio.
+        
+        Args:
+            audio_path: Caminho do áudio
+            params: Parâmetros para transcrição
+            
+        Returns:
+            Resultado da transcrição
+        """
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
@@ -126,215 +209,363 @@ class WhisperTranscriber:
             
             start_time = time.time()
             
-            # Callback simulado (Whisper não oferece progress real)
-            def progress_callback(seek, total):
-                progress.update(task, completed=int((seek / total) * 100))
+            # Callback para progresso
+            def callback(current, total):
+                progress.update(task, completed=int((current / total) * 100))
             
-            result = self.model.transcribe(str(audio_path), **params)
+            # Transcrever com Whisper
+            result = self.model.transcribe(
+                str(audio_path),
+                **params,
+                progress_callback=callback if hasattr(self.model, 'transcribe_with_progress') else None
+            )
             
             progress.update(task, completed=100)
             elapsed = time.time() - start_time
         
         # Adicionar metadados
-        # Calcular duração do áudio se não fornecida pelo Whisper
-        audio_duration = result.get("duration", 0)
-        if audio_duration == 0 and "segments" in result and result["segments"]:
-            # Pegar o timestamp final do último segmento
-            audio_duration = result["segments"][-1]["end"]
-        
-        result["metadata"] = {
-            "file": audio_path.name,
-            "duration": audio_duration,
-            "processing_time": elapsed,
-            "model": self.model_size,
-            "language": result.get("language", params["language"]),
-            "device": self.device,
-        }
-        
-        # Calcular velocidade de processamento
-        if result["metadata"]["duration"] > 0:
-            speed_ratio = result["metadata"]["duration"] / elapsed
-            console.print(
-                f"✅ Transcrição concluída em {elapsed:.1f}s "
-                f"([bold green]{speed_ratio:.1f}x[/bold green] tempo real)"
-            )
+        result["processing_time"] = elapsed
+        result["method"] = "single"
         
         return result
     
-    def transcribe_with_segments(
-        self, 
-        audio_path: Union[str, Path],
-        **kwargs
-    ) -> Dict:
+    def _transcribe_long_audio(self, audio_path: Path, params: Dict) -> Dict:
         """
-        Transcreve áudio retornando segmentos detalhados com timestamps.
+        Transcreve áudio longo usando estratégia de chunks.
         
         Args:
-            audio_path: Caminho para o arquivo de áudio
-            **kwargs: Argumentos para transcribe()
+            audio_path: Caminho do áudio
+            params: Parâmetros para transcrição
             
         Returns:
-            Dict com transcrição completa e segmentos
+            Resultado combinado da transcrição
         """
-        result = self.transcribe(audio_path, **kwargs)
+        # Dividir áudio em chunks por silêncio ou duração
+        console.print("✂️  Dividindo áudio em segmentos...")
         
-        # Formatar segmentos
-        segments = []
-        for segment in result.get("segments", []):
-            seg_data = {
-                "id": segment["id"],
-                "start": segment["start"],
-                "end": segment["end"],
-                "text": segment["text"].strip(),
-                "duration": segment["end"] - segment["start"],
-            }
-            
-            # Adicionar palavras com timestamps se disponível
-            if "words" in segment and OUTPUT_CONFIG["include_timestamps"]:
-                seg_data["words"] = [
-                    {
-                        "word": word["word"],
-                        "start": word["start"],
-                        "end": word["end"],
-                        "confidence": word.get("probability", 1.0)
-                    }
-                    for word in segment["words"]
-                ]
-            
-            segments.append(seg_data)
+        # Tentar dividir por silêncio primeiro
+        chunks = self.audio_processor.split_audio_by_silence(
+            audio_path,
+            min_silence_len=500,    # 500ms de silêncio
+            silence_thresh=-35,     # Threshold mais sensível
+            keep_silence=250        # Manter 250ms de contexto
+        )
         
-        return {
-            "text": result["text"],
-            "segments": segments,
-            "metadata": result["metadata"]
+        # Se não encontrou silêncios suficientes, dividir por tempo
+        if len(chunks) < 2:
+            chunks = self.audio_processor.split_audio_by_duration(
+                audio_path,
+                chunk_duration=240  # 4 minutos por chunk
+            )
+        
+        console.print(f"📚 Processando {len(chunks)} segmentos...")
+        
+        # Transcrever cada chunk
+        all_segments = []
+        full_text = []
+        total_duration = 0
+        
+        for i, chunk_path in enumerate(chunks):
+            console.print(f"\n🎤 Segmento {i+1}/{len(chunks)}")
+            
+            # Usar prompt do segmento anterior para continuidade
+            if i > 0 and all_segments:
+                # Pegar últimas palavras do segmento anterior
+                prev_text = all_segments[-1]["text"]
+                last_words = " ".join(prev_text.split()[-10:])
+                params["initial_prompt"] = f"...{last_words}"
+            
+            # Transcrever chunk
+            chunk_result = self._transcribe_single(chunk_path, params.copy())
+            
+            # Ajustar timestamps
+            if all_segments:
+                time_offset = all_segments[-1]["end"]
+                for segment in chunk_result.get("segments", []):
+                    segment["start"] += time_offset
+                    segment["end"] += time_offset
+                    segment["id"] = len(all_segments) + segment["id"]
+            
+            # Adicionar aos resultados
+            all_segments.extend(chunk_result.get("segments", []))
+            full_text.append(chunk_result.get("text", "").strip())
+            
+            # Atualizar duração
+            if chunk_result.get("segments"):
+                total_duration = chunk_result["segments"][-1]["end"]
+            
+            # Limpar chunk temporário
+            chunk_path.unlink()
+        
+        # Combinar resultados
+        result = {
+            "text": " ".join(full_text),
+            "segments": all_segments,
+            "language": params["language"],
+            "duration": total_duration,
+            "method": "chunks",
+            "num_chunks": len(chunks)
         }
+        
+        return result
     
-    def save_transcription(
-        self, 
-        result: Dict,
-        output_path: Optional[Path] = None,
-        format: str = "json"
-    ) -> Path:
+    def _postprocess_transcription(self, result: Dict) -> Dict:
         """
-        Salva a transcrição em arquivo.
+        Pós-processa a transcrição para melhorar qualidade.
+        
+        Args:
+            result: Resultado bruto da transcrição
+            
+        Returns:
+            Resultado processado
+        """
+        console.print("\n🔧 Aplicando pós-processamento...")
+        
+        # Remover repetições excessivas
+        result["text"] = self._remove_repetitions(result["text"])
+        
+        # Limpar segmentos
+        cleaned_segments = []
+        for segment in result.get("segments", []):
+            # Remover segmentos vazios ou muito curtos
+            if len(segment["text"].strip()) < 3:
+                continue
+            
+            # Limpar texto do segmento
+            segment["text"] = self._clean_segment_text(segment["text"])
+            
+            # Calcular confiança média se disponível
+            if "words" in segment:
+                confidences = [w.get("probability", 1.0) for w in segment["words"]]
+                segment["avg_confidence"] = sum(confidences) / len(confidences) if confidences else 1.0
+            
+            cleaned_segments.append(segment)
+        
+        result["segments"] = cleaned_segments
+        
+        # Adicionar estatísticas de qualidade
+        result["quality_metrics"] = self._calculate_quality_metrics(result)
+        
+        return result
+    
+    def _remove_repetitions(self, text: str) -> str:
+        """Remove repetições excessivas do texto."""
+        import re
+        
+        # Remover múltiplos espaços
+        text = re.sub(r'\s+', ' ', text)
+        
+        # Remover repetições de palavras (3+ vezes)
+        text = re.sub(r'\b(\w+)(\s+\1){2,}\b', r'\1', text)
+        
+        # Remover múltiplos pontos consecutivos (mais de 3)
+        text = re.sub(r'\.{4,}', '...', text)
+        
+        return text.strip()
+    
+    def _clean_segment_text(self, text: str) -> str:
+        """Limpa o texto de um segmento."""
+        # Remover espaços extras
+        text = " ".join(text.split())
+        
+        # Capitalizar primeira letra
+        if text and text[0].islower():
+            text = text[0].upper() + text[1:]
+        
+        # Adicionar pontuação final se não houver
+        if text and text[-1] not in '.!?':
+            text += '.'
+        
+        return text
+    
+    def _calculate_quality_metrics(self, result: Dict) -> Dict:
+        """
+        Calcula métricas de qualidade da transcrição.
         
         Args:
             result: Resultado da transcrição
-            output_path: Caminho de saída (None para usar padrão)
-            format: Formato de saída (json, txt, srt, vtt)
             
         Returns:
-            Path do arquivo salvo
+            Dict com métricas de qualidade
         """
-        if output_path is None:
-            filename = Path(result["metadata"]["file"]).stem
-            timestamp = time.strftime("%Y%m%d_%H%M%S")
-            output_path = TRANSCRIPT_DIR / f"{filename}_{timestamp}.{format}"
+        segments = result.get("segments", [])
         
-        output_path = Path(output_path)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        
-        if format == "json":
-            with open(output_path, "w", encoding="utf-8") as f:
-                json.dump(result, f, ensure_ascii=False, indent=2)
-        
-        elif format == "txt":
-            with open(output_path, "w", encoding="utf-8") as f:
-                f.write(result["text"])
-        
-        elif format == "srt":
-            content = self._to_srt(result.get("segments", []))
-            with open(output_path, "w", encoding="utf-8") as f:
-                f.write(content)
-        
-        elif format == "vtt":
-            content = self._to_vtt(result.get("segments", []))
-            with open(output_path, "w", encoding="utf-8") as f:
-                f.write(content)
-        
-        else:
-            raise ValueError(f"Formato não suportado: {format}")
-        
-        console.print(f"💾 Transcrição salva em: [bold]{output_path}[/bold]")
-        return output_path
-    
-    def _to_srt(self, segments: List[Dict]) -> str:
-        """Converte segmentos para formato SRT."""
-        lines = []
-        for i, segment in enumerate(segments, 1):
-            start = self._seconds_to_time(segment["start"])
-            end = self._seconds_to_time(segment["end"])
-            lines.append(f"{i}")
-            lines.append(f"{start} --> {end}")
-            lines.append(segment["text"])
-            lines.append("")
-        return "\n".join(lines)
-    
-    def _to_vtt(self, segments: List[Dict]) -> str:
-        """Converte segmentos para formato WebVTT."""
-        lines = ["WEBVTT", ""]
-        for segment in segments:
-            start = self._seconds_to_time(segment["start"], vtt=True)
-            end = self._seconds_to_time(segment["end"], vtt=True)
-            lines.append(f"{start} --> {end}")
-            lines.append(segment["text"])
-            lines.append("")
-        return "\n".join(lines)
-    
-    @staticmethod
-    def _seconds_to_time(seconds: float, vtt: bool = False) -> str:
-        """Converte segundos para formato de tempo."""
-        hours = int(seconds // 3600)
-        minutes = int((seconds % 3600) // 60)
-        secs = seconds % 60
-        
-        if vtt:
-            return f"{hours:02d}:{minutes:02d}:{secs:06.3f}"
-        else:
-            # SRT usa vírgula como separador decimal
-            return f"{hours:02d}:{minutes:02d}:{secs:06.3f}".replace(".", ",")
-    
-    def detect_language(self, audio_path: Union[str, Path]) -> str:
-        """
-        Detecta o idioma do áudio.
-        
-        Args:
-            audio_path: Caminho para o arquivo de áudio
-            
-        Returns:
-            Código do idioma detectado
-        """
-        audio_path = Path(audio_path)
-        
-        console.print(f"🔍 Detectando idioma de: [bold]{audio_path.name}[/bold]")
-        
-        # Detectar usando os primeiros 30 segundos
-        audio = whisper.load_audio(str(audio_path))
-        audio = whisper.pad_or_trim(audio)
-        
-        mel = whisper.log_mel_spectrogram(audio).to(self.model.device)
-        
-        _, probs = self.model.detect_language(mel)
-        detected_lang = max(probs, key=probs.get)
-        
-        console.print(f"🌐 Idioma detectado: [bold green]{detected_lang}[/bold green] "
-                     f"(confiança: {probs[detected_lang]:.1%})")
-        
-        return detected_lang
-    
-    def get_device_info(self) -> Dict:
-        """Retorna informações sobre o dispositivo em uso."""
-        info = {
-            "device": self.device,
-            "device_name": torch.cuda.get_device_name() if self.device == "cuda" else "CPU",
-            "cuda_available": torch.cuda.is_available(),
+        metrics = {
+            "total_segments": len(segments),
+            "total_words": len(result["text"].split()),
+            "avg_segment_confidence": 0,
+            "low_confidence_segments": 0,
+            "silence_ratio": 0,
         }
         
-        if self.device == "cuda":
-            info.update({
-                "gpu_memory_total": torch.cuda.get_device_properties(0).total_memory / 1024**3,
-                "gpu_memory_allocated": torch.cuda.memory_allocated() / 1024**3,
-                "gpu_memory_reserved": torch.cuda.memory_reserved() / 1024**3,
-            })
+        if segments:
+            # Calcular confiança média
+            confidences = [s.get("avg_confidence", 1.0) for s in segments]
+            metrics["avg_segment_confidence"] = sum(confidences) / len(confidences)
+            
+            # Contar segmentos de baixa confiança
+            metrics["low_confidence_segments"] = sum(1 for c in confidences if c < 0.8)
+            
+            # Calcular proporção de silêncio
+            total_duration = result.get("duration", 0)
+            speech_duration = sum(s["end"] - s["start"] for s in segments)
+            if total_duration > 0:
+                metrics["silence_ratio"] = 1 - (speech_duration / total_duration)
         
-        return info
+        return metrics
+    
+    def _get_language_prompt(self, language: str) -> str:
+        """
+        Retorna um prompt apropriado para o idioma.
+        
+        Args:
+            language: Código do idioma
+            
+        Returns:
+            Prompt inicial para melhorar a transcrição
+        """
+        prompts = {
+            "pt": "Esta é uma transcrição em português. O áudio pode conter termos técnicos.",
+            "en": "This is an English transcription. The audio may contain technical terms.",
+            "es": "Esta es una transcripción en español. El audio puede contener términos técnicos.",
+        }
+        
+        return prompts.get(language, "")
+    
+    def transcribe_with_fallback(
+        self,
+        audio_path: Union[str, Path],
+        models: List[str] = ["small", "medium", "large"],
+        **kwargs
+    ) -> Dict:
+        """
+        Tenta transcrever com múltiplos modelos em caso de falha.
+        
+        Args:
+            audio_path: Caminho do áudio
+            models: Lista de modelos para tentar em ordem
+            **kwargs: Argumentos para transcrição
+            
+        Returns:
+            Melhor resultado obtido
+        """
+        audio_path = Path(audio_path)
+        best_result = None
+        best_score = 0
+        
+        for model_size in models:
+            try:
+                console.print(f"\n🔄 Tentando com modelo [bold]{model_size}[/bold]...")
+                
+                # Criar novo transcritor com o modelo
+                transcriber = WhisperTranscriber(
+                    model_size=model_size,
+                    device=self.device
+                )
+                
+                # Transcrever
+                result = transcriber.transcribe_enhanced(audio_path, **kwargs)
+                
+                # Calcular score de qualidade
+                metrics = result.get("quality_metrics", {})
+                score = (
+                    metrics.get("avg_segment_confidence", 0) * 0.5 +
+                    (1 - metrics.get("silence_ratio", 1)) * 0.3 +
+                    (1 - metrics.get("low_confidence_segments", 0) / max(metrics.get("total_segments", 1), 1)) * 0.2
+                )
+                
+                console.print(f"   Score de qualidade: [bold]{score:.2f}[/bold]")
+                
+                # Manter melhor resultado
+                if score > best_score:
+                    best_result = result
+                    best_score = score
+                    best_result["model_used"] = model_size
+                
+                # Se score é bom o suficiente, parar
+                if score > 0.85:
+                    break
+                    
+            except Exception as e:
+                console.print(f"   [yellow]⚠️  Falha com {model_size}: {e}[/yellow]")
+                continue
+        
+        if not best_result:
+            raise RuntimeError("Falha ao transcrever com todos os modelos")
+        
+        console.print(f"\n✅ Melhor resultado com modelo: [bold green]{best_result['model_used']}[/bold green]")
+        return best_result
+    
+    def generate_quality_report(self, result: Dict) -> None:
+        """
+        Gera um relatório de qualidade da transcrição.
+        
+        Args:
+            result: Resultado da transcrição
+        """
+        console.print("\n" + "="*50)
+        console.print("[bold cyan]RELATÓRIO DE QUALIDADE DA TRANSCRIÇÃO[/bold cyan]")
+        console.print("="*50 + "\n")
+        
+        # Informações gerais
+        metadata = result.get("metadata", {})
+        metrics = result.get("quality_metrics", {})
+        
+        info_table = Table(show_header=False, box=None)
+        info_table.add_column("Métrica", style="cyan")
+        info_table.add_column("Valor", style="white")
+        
+        info_table.add_row("Arquivo:", metadata.get("file", "N/A"))
+        info_table.add_row("Duração:", f"{metadata.get('duration', 0):.1f}s")
+        info_table.add_row("Modelo:", metadata.get("model", "N/A"))
+        info_table.add_row("Método:", result.get("method", "N/A"))
+        info_table.add_row("Idioma:", result.get("language", "N/A"))
+        
+        console.print(info_table)
+        console.print()
+        
+        # Métricas de qualidade
+        quality_table = Table(title="Métricas de Qualidade", show_lines=True)
+        quality_table.add_column("Métrica", style="cyan")
+        quality_table.add_column("Valor", style="white")
+        quality_table.add_column("Status", style="white")
+        
+        # Confiança média
+        avg_conf = metrics.get("avg_segment_confidence", 0)
+        conf_status = "[green]Ótimo[/green]" if avg_conf > 0.9 else "[yellow]Bom[/yellow]" if avg_conf > 0.8 else "[red]Baixo[/red]"
+        quality_table.add_row("Confiança Média", f"{avg_conf:.1%}", conf_status)
+        
+        # Segmentos de baixa confiança
+        low_conf = metrics.get("low_confidence_segments", 0)
+        total_segs = metrics.get("total_segments", 1)
+        low_conf_ratio = low_conf / total_segs if total_segs > 0 else 0
+        low_conf_status = "[green]Ótimo[/green]" if low_conf_ratio < 0.1 else "[yellow]Aceitável[/yellow]" if low_conf_ratio < 0.2 else "[red]Alto[/red]"
+        quality_table.add_row("Segmentos Baixa Confiança", f"{low_conf}/{total_segs} ({low_conf_ratio:.1%})", low_conf_status)
+        
+        # Taxa de silêncio
+        silence_ratio = metrics.get("silence_ratio", 0)
+        silence_status = "[green]Normal[/green]" if silence_ratio < 0.3 else "[yellow]Alto[/yellow]" if silence_ratio < 0.5 else "[red]Muito Alto[/red]"
+        quality_table.add_row("Taxa de Silêncio", f"{silence_ratio:.1%}", silence_status)
+        
+        # Total de palavras
+        total_words = metrics.get("total_words", 0)
+        quality_table.add_row("Total de Palavras", str(total_words), "[green]OK[/green]")
+        
+        console.print(quality_table)
+        
+        # Recomendações
+        console.print("\n[bold]Recomendações:[/bold]")
+        
+        if avg_conf < 0.8:
+            console.print("• [yellow]Considere usar um modelo maior para melhor qualidade[/yellow]")
+        
+        if low_conf_ratio > 0.2:
+            console.print("• [yellow]Muitos segmentos com baixa confiança - verifique a qualidade do áudio[/yellow]")
+        
+        if silence_ratio > 0.5:
+            console.print("• [yellow]Alto índice de silêncio - considere editar o áudio antes da transcrição[/yellow]")
+        
+        if total_words < 50:
+            console.print("• [yellow]Poucas palavras detectadas - verifique se o áudio contém fala[/yellow]")
+        
+        console.print("\n" + "="*50)
