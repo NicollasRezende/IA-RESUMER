@@ -1,0 +1,76 @@
+[tool.poetry]
+name = "audio-transcription-system"
+version = "1.0.0"
+description = "Sistema completo de transcrição de áudio e vídeo usando OpenAI Whisper"
+authors = ["Seu Nome <seu-email@exemplo.com>"]
+readme = "README.md"
+packages = [{include = "src"}]
+
+[tool.poetry.dependencies]
+python = "^3.8"
+openai-whisper
+torch = "^2.0.0"
+torchaudio = "^2.0.0"
+numpy = "^1.24.0"
+pydub = "^0.25.1"
+ffmpeg-python = "^0.2.0"
+yt-dlp = "^2024.1.0"
+python-dotenv = "^1.0.0"
+tqdm = "^4.65.0"
+rich = "^13.0.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^7.4.3"
+pytest-asyncio = "^0.21.1"
+pytest-cov = "^4.1.0"
+black = "^23.12.0"
+flake8 = "^6.1.0"
+isort = "^5.13.0"
+pre-commit = "^3.5.0"
+
+[tool.poetry.group.api]
+optional = true
+
+[tool.poetry.group.api.dependencies]
+fastapi = "^0.104.1"
+uvicorn = "^0.24.0"
+celery = "^5.3.4"
+redis = "^5.0.1"
+python-multipart = "^0.0.6"
+
+[tool.poetry.scripts]
+transcribe = "main:main"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.black]
+line-length = 88
+target-version = ['py38']
+include = '\.pyi?$'
+
+[tool.isort]
+profile = "black"
+line_length = 88
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+python_classes = "Test*"
+python_functions = "test_*"
+addopts = "-v --tb=short"
+
+[tool.coverage.run]
+source = ["src"]
+omit = ["tests/*", "*/tests/*"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+]
